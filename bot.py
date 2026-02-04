@@ -26,6 +26,45 @@ ACTIVATE_METHOD_ID = "0x0f15f4c0"
 # =============================
 # UTILITIES
 # =============================
+def load_config():
+    """Load configuration from config.json"""
+    try:
+        import json
+        with open("config.json", "r") as f:
+            return json.load(f)
+    except:
+        # Return default config if file doesn't exist
+        return {
+            "captcha": {
+                "api_key": "1AWbkb0rj2Cls2CNajIpLO8Aurop3NtY",
+                "sitekey": "0x4AAAAAACWrJYbcjOjaTq3u",
+                "pageurl": "https://dgrid.ai/"
+            }
+        }
+
+def load_proxies():
+    """Load proxy list from proxy.txt (1 proxy per wallet)"""
+    proxies = []
+    try:
+        with open("proxy.txt", "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith("#"):
+                    proxies.append(line)
+    except:
+        pass
+    return proxies
+
+def get_proxy_dict(proxy_url):
+    """Convert proxy URL to requests proxy dict"""
+    if not proxy_url:
+        return None
+    return {
+        "http": proxy_url,
+        "https": proxy_url
+    }
+
 def get_web3():
     """Get connected Web3 instance"""
     for rpc in BNB_RPC_LIST:
@@ -60,9 +99,11 @@ def load_x_cookies():
                     cookies.append((parts[0], parts[1]))
     return cookies
 
-def create_x_session(auth_token, ct0):
+def create_x_session(auth_token, ct0, proxies=None):
     """Create X session with specific cookies"""
     s = requests.Session()
+    if proxies:
+        s.proxies.update(proxies)
     s.cookies.set("auth_token", auth_token, domain=".twitter.com")
     s.cookies.set("ct0", ct0, domain=".twitter.com")
     s.cookies.set("auth_token", auth_token, domain=".x.com")
@@ -77,14 +118,172 @@ def create_x_session(auth_token, ct0):
     })
     return s
 
+def get_user_id_from_username(session, username):
+    """Get Twitter user ID from username using GraphQL endpoint"""
+    import json
+    
+    url = "https://x.com/i/api/graphql/-oaLodhGbbnzJBACb1kk2Q/UserByScreenName"
+    
+    variables = {
+        "screen_name": username,
+        "withGrokTranslatedBio": False
+    }
+    
+    features = {
+        "hidden_profile_subscriptions_enabled": True,
+        "profile_label_improvements_pcf_label_in_post_enabled": True,
+        "responsive_web_profile_redirect_enabled": False,
+        "rweb_tipjar_consumption_enabled": False,
+        "verified_phone_label_enabled": False,
+        "subscriptions_verification_info_is_identity_verified_enabled": True,
+        "subscriptions_verification_info_verified_since_enabled": True,
+        "highlights_tweets_tab_ui_enabled": True,
+        "responsive_web_twitter_article_notes_tab_enabled": True,
+        "subscriptions_feature_can_gift_premium": True,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+        "responsive_web_graphql_timeline_navigation_enabled": True
+    }
+    
+    field_toggles = {
+        "withPayments": False,
+        "withAuxiliaryUserLabels": True
+    }
+    
+    params = {
+        "variables": json.dumps(variables),
+        "features": json.dumps(features),
+        "fieldToggles": json.dumps(field_toggles)
+    }
+    
+    try:
+        r = session.get(url, params=params)
+        
+        if r.status_code == 200:
+            data = r.json()
+            user_data = data.get("data", {}).get("user", {}).get("result", {})
+            
+            if user_data and user_data.get("__typename") == "User":
+                user_id = user_data.get("rest_id")
+                if user_id:
+                    return user_id, None
+        
+        return None, f"Error {r.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+def check_following(session, user_id):
+    """Check if already following a user"""
+    url = "https://x.com/i/api/1.1/friendships/show.json"
+    
+    params = {"target_id": user_id}
+    
+    try:
+        r = session.get(url, params=params)
+        
+        if r.status_code == 200:
+            data = r.json()
+            relationship = data.get("relationship", {})
+            source = relationship.get("source", {})
+            return source.get("following", False), None
+        else:
+            return None, f"Error {r.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+def follow_user(session, user_id):
+    """Follow a user by user_id"""
+    url = "https://x.com/i/api/1.1/friendships/create.json"
+    
+    data = {
+        "include_profile_interstitial_type": "1",
+        "include_blocking": "1",
+        "include_blocked_by": "1",
+        "include_followed_by": "1",
+        "include_want_retweets": "1",
+        "include_mute_edge": "1",
+        "include_can_dm": "1",
+        "include_can_media_tag": "1",
+        "include_ext_is_blue_verified": "1",
+        "include_ext_verified_type": "1",
+        "include_ext_profile_image_shape": "1",
+        "skip_status": "1",
+        "user_id": user_id
+    }
+    
+    try:
+        r = session.post(url, data=data)
+        
+        if r.status_code == 200:
+            return True, "OK"
+        elif r.status_code == 403:
+            return False, "Account suspended or protected"
+        else:
+            return False, f"Error {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
 # =============================
 # DGRID API FUNCTIONS
 # =============================
-def dgrid_auth(address, private_key):
+def solve_turnstile_captcha(config, proxies=None):
+    """Solve Cloudflare Turnstile captcha using sctg.xyz API"""
+    captcha_config = config.get("captcha", {})
+    api_key = captcha_config.get("api_key", "1AWbkb0rj2Cls2CNajIpLO8Aurop3NtY")
+    sitekey = captcha_config.get("sitekey", "0x4AAAAAACWrJYbcjOjaTq3u")
+    pageurl = captcha_config.get("pageurl", "https://dgrid.ai/")
+    
+    try:
+        # Submit captcha task
+        params = {
+            "key": api_key,
+            "method": "turnstile",
+            "pageurl": pageurl,
+            "sitekey": sitekey
+        }
+        
+        r = requests.get("https://sctg.xyz/in.php", params=params, proxies=proxies, timeout=30)
+        result = r.text.strip()
+        
+        if "|" not in result:
+            return None, f"Captcha submission failed: {result}"
+        
+        status, task_id = result.split("|", 1)
+        
+        # Poll for result
+        max_wait = 120  # 2 minutes
+        poll_interval = 5
+        start_time = time.time()
+        
+        while (time.time() - start_time) < max_wait:
+            time.sleep(poll_interval)
+            
+            poll_params = {
+                "key": api_key,
+                "id": task_id,
+                "action": "get"
+            }
+            
+            poll_response = requests.get("https://sctg.xyz/res.php", params=poll_params, proxies=proxies, timeout=30)
+            poll_result = poll_response.text.strip()
+            
+            if "NOT_READY" not in poll_result and "PROCESSING" not in poll_result:
+                if poll_result.startswith("OK|"):
+                    # Extract the actual token after OK|
+                    token = poll_result.split("|", 1)[1]
+                    return token, None
+                else:
+                    return None, f"Captcha failed: {poll_result}"
+        
+        return None, "Captcha timeout"
+    except Exception as e:
+        return None, str(e)
+
+def dgrid_auth(address, private_key, proxies=None):
     """Authenticate with DGRID"""
     try:
         r = requests.post("https://api2.dgrid.ai/api/v1/client-user/get-code",
-            json={"address": address}, headers={"content-type": "application/json"}, timeout=30)
+            json={"address": address}, headers={"content-type": "application/json"}, proxies=proxies, timeout=30)
         
         if r.status_code != 200 or not r.text:
             raise Exception(f"get-code failed: HTTP {r.status_code}")
@@ -107,7 +306,7 @@ def dgrid_auth(address, private_key):
             pass
         
         r = requests.post("https://api2.dgrid.ai/api/v1/client-user/challenge",
-            json={"address": address, "signature": signature, "inviteCode": invite}, timeout=30)
+            json={"address": address, "signature": signature, "inviteCode": invite}, proxies=proxies, timeout=30)
         
         if r.status_code != 200 or not r.text:
             raise Exception(f"challenge failed: HTTP {r.status_code}")
@@ -122,24 +321,24 @@ def dgrid_auth(address, private_key):
     except requests.exceptions.RequestException as e:
         raise Exception(f"Auth network error: {str(e)}")
 
-def bind_invite(token):
+def bind_invite(token, proxies=None):
     try:
         with open(REFF_FILE, "r") as f:
             code = f.readline().strip()
         r = requests.post(f"https://api2.dgrid.ai/api/v1/invite-code/{code}/bind-relation",
-            headers={"authorization": f"Bearer {token}"})
+            headers={"authorization": f"Bearer {token}"}, proxies=proxies)
         return "success" in r.text.lower() or "already" in r.text.lower()
     except:
         return False
 
-def bind_x(token, auth_token, ct0):
+def bind_x(token, auth_token, ct0, proxies=None):
     """Auto bind X/Twitter with specific account"""
     try:
         x_session = create_x_session(auth_token, ct0)
         
         r = requests.get("https://api2.dgrid.ai/api/v1/me/x-bind",
             headers={"authorization": f"Bearer {token}"},
-            params={"redirect": "https://dgrid.ai/arena/activate"})
+            params={"redirect": "https://dgrid.ai/arena/activate"}, proxies=proxies)
         
         result = r.json()
         if result.get("code") != "200":
@@ -180,14 +379,14 @@ def bind_x(token, auth_token, ct0):
     except:
         return False
 
-def claim_follow_mission(token):
+def claim_follow_mission(token, proxies=None):
     """Claim follow mission reward via sub-verification API"""
     try:
         r = requests.get("https://api2.dgrid.ai/api/v1/me/sub-verification",
             headers={
                 "authorization": f"Bearer {token}",
                 "accept": "application/json, text/plain, */*"
-            }, timeout=30)
+            }, proxies=proxies, timeout=30)
         if r.status_code == 200:
             data = r.json()
             return True, data
@@ -195,7 +394,7 @@ def claim_follow_mission(token):
     except Exception as e:
         return False, str(e)
 
-def verify_subscription(token, verbose=False):
+def verify_subscription(token, proxies=None, verbose=False):
     """Verify subscription status from arena/ticket"""
     for attempt in range(5):
         try:
@@ -203,7 +402,7 @@ def verify_subscription(token, verbose=False):
                 headers={
                     "authorization": f"Bearer {token}",
                     "accept": "application/json, text/plain, */*"
-                }, timeout=30)
+                }, proxies=proxies, timeout=30)
             
             if r.status_code == 200:
                 data = r.json().get("data", {})
@@ -221,31 +420,43 @@ def verify_subscription(token, verbose=False):
         time.sleep(3)
     return False, "Max retries exceeded"
 
-def check_ticket(token):
+def check_ticket(token, proxies=None):
     r = requests.get("https://api2.dgrid.ai/api/v1/arena/ticket",
-        headers={"authorization": f"Bearer {token}"})
+        headers={"authorization": f"Bearer {token}"}, proxies=proxies)
     if r.status_code == 200:
         return r.json().get("data", {})
     return {}
 
-def get_account_info(token):
+def get_account_info(token, proxies=None):
     """Get account info including bound Twitter details"""
     try:
         r = requests.get("https://api2.dgrid.ai/api/v1/me",
             headers={
                 "authorization": f"Bearer {token}",
                 "accept": "application/json, text/plain, */*"
-            }, timeout=30)
+            }, proxies=proxies, timeout=30)
         if r.status_code == 200:
             return r.json().get("data", {})
     except:
         pass
     return {}
 
-def complete_missions(token):
-    """Complete all daily missions"""
-    r = requests.get("https://api2.dgrid.ai/api/v1/arena/missions?locale=en",
-        headers={"authorization": f"Bearer {token}"})
+def complete_missions(token, config, proxies=None):
+    """Complete all daily missions with Turnstile captcha verification"""
+    # Solve Turnstile captcha first
+    captcha_token, captcha_err = solve_turnstile_captcha(config, proxies)
+    if captcha_err:
+        print(f"   ⚠ Captcha error: {captcha_err}")
+        return 0, 0
+    
+    # Include captcha token in headers
+    headers = {
+        "authorization": f"Bearer {token}",
+        "accept": "application/json, text/plain, */*",
+        "cf-turnstile-response": captcha_token
+    }
+    
+    r = requests.get("https://api2.dgrid.ai/api/v1/arena/missions?locale=en", headers=headers, proxies=proxies)
     
     if r.status_code != 200:
         return 0, 0
@@ -266,7 +477,7 @@ def complete_missions(token):
         if len(answers) >= 2:
             answer = answers[random.randint(0, 1)]
             url = f"https://api2.dgrid.ai/api/v1/arena/missions/{group_id}/questions/{m['question_id']}/options/{answer}"
-            r = requests.post(url, headers={"authorization": f"Bearer {token}", "content-type": "application/json"}, json={})
+            r = requests.post(url, headers={"authorization": f"Bearer {token}", "content-type": "application/json"}, json={}, proxies=proxies)
             if r.status_code == 200:
                 pts = r.json().get("data", {}).get("reward", 0)
                 total_pts += pts
@@ -275,9 +486,9 @@ def complete_missions(token):
     
     return completed, total_pts
 
-def get_leaderboard(token):
+def get_leaderboard(token, proxies=None):
     r = requests.get("https://api2.dgrid.ai/api/v1/arena/leaderboard/me",
-        headers={"authorization": f"Bearer {token}"})
+        headers={"authorization": f"Bearer {token}"}, proxies=proxies)
     if r.status_code == 200:
         return r.json().get("data", {})
     return {}
@@ -318,7 +529,7 @@ def sign_chain(w3, private_key, address):
         return False, str(e)
 
 def transfer_all_balance(w3, from_pk, to_address):
-    """Transfer all remaining BNB to next wallet"""
+    """Transfer remaining BNB to next wallet, keeping 0.0001 BNB reserve"""
     try:
         from_account = Account.from_key(from_pk)
         from_address = from_account.address
@@ -328,10 +539,13 @@ def transfer_all_balance(w3, from_pk, to_address):
         gas_limit = 21000
         gas_cost = gas_price * gas_limit
         
-        if balance <= gas_cost:
+        # Keep 0.0001 BNB reserve for future transactions
+        reserve = w3.to_wei(0.0001, 'ether')
+        
+        if balance <= gas_cost + reserve:
             return False, "No balance to transfer"
         
-        amount = balance - gas_cost
+        amount = balance - gas_cost - reserve
         
         tx = {
             'nonce': w3.eth.get_transaction_count(from_address),
@@ -353,22 +567,41 @@ def transfer_all_balance(w3, from_pk, to_address):
 # =============================
 # MAIN PROCESS
 # =============================
-def try_x_bind_and_claim(token, auth_token, ct0, x_index):
-    """Try to bind X and claim follow mission. Returns (success, error_type, message)"""
+def try_x_bind_and_claim(token, auth_token, ct0, x_index, dgrid_user_id, proxies=None):
+    """Try to bind X, follow @dgrid_ai, and claim follow mission. Returns (success, error_type, message)"""
     # X Bind
-    x_ok = bind_x(token, auth_token, ct0)
+    x_ok = bind_x(token, auth_token, ct0, proxies)
     if not x_ok:
         return False, "x_bind", f"X Bind failed (Twitter #{x_index})"
     
-    # Claim follow mission reward (assumes follow already done via follow.py)
-    claim_ok, claim_result = claim_follow_mission(token)
+    # Follow @dgrid_ai
+    x_session = create_x_session(auth_token, ct0, proxies)
+    
+    # Check if already following
+    is_following, check_err = check_following(x_session, dgrid_user_id)
+    
+    if check_err:
+        # Error checking, but continue anyway
+        pass
+    elif is_following:
+        # Already following, skip
+        pass
+    else:
+        # Not following yet, do follow
+        follow_ok, follow_msg = follow_user(x_session, dgrid_user_id)
+        if not follow_ok:
+            # Follow failed, but continue with claim attempt
+            pass
+    
+    # Claim follow mission reward
+    claim_ok, claim_result = claim_follow_mission(token, proxies)
     if claim_ok:
         return True, None, f"OK (Twitter #{x_index})"
     
     # Even if claim fails, X Bind was successful - continue
     return True, None, f"OK (Twitter #{x_index}) - claim pending"
 
-def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, total, next_address=None):
+def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, total, config, proxies, next_address=None, dgrid_user_id=None):
     """Process wallet with Twitter fallback support"""
     account = Account.from_key(private_key)
     address = account.address
@@ -377,11 +610,11 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
     
     try:
         # Auth
-        token = dgrid_auth(address, private_key)
+        token = dgrid_auth(address, private_key, proxies)
         print("   ✓ Auth OK")
         
         # Check current status first
-        ticket = check_ticket(token)
+        ticket = check_ticket(token, proxies)
         has_x = ticket.get("hasBoundX", False)
         has_sub = ticket.get("hasSubscribed", False)
         has_chain = ticket.get("hasSignedChain", False)
@@ -394,15 +627,15 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
             print("   ✓ Chain: Already signed")
             
             # Just do missions and show leaderboard
-            completed, pts = complete_missions(token)
+            completed, pts = complete_missions(token, config, proxies)
             print(f"   ✓ Missions: +{pts} pts ({completed} new)")
             
             # Claim follow mission reward
-            follow_claimed, _ = claim_follow_mission(token)
+            follow_claimed, _ = claim_follow_mission(token, proxies)
             if follow_claimed:
                 print("   ✓ Follow Mission: Claimed")
             
-            lb = get_leaderboard(token)
+            lb = get_leaderboard(token, proxies)
             print(f"   ✓ Rank: #{lb.get('rank', 0)} | Weekly: {lb.get('weeklyPoints', 0)} pts")
             
             # Transfer to next wallet if success
@@ -417,7 +650,7 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
             return True, "Already complete", None
         
         # Bind invite
-        bind_invite(token)
+        bind_invite(token, proxies)
         
         # Check if X bind and subscribe needed
         if has_x and has_sub:
@@ -425,21 +658,23 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
             print("   ✓ Follow Claim: Already done")
             used_x_index = None
         else:
-            # Try X Bind and Subscribe with fallback
+            # Pool-based: use next available Twitter account from pool
             x_success = False
             used_x_index = None
             
+            # Find next unused Twitter account
             for x_idx, x_cookie in enumerate(available_x_cookies):
                 if x_idx in used_x_indices:
                     continue  # Skip already used Twitter accounts
                 
                 auth_token, ct0 = x_cookie
-                print(f"   🐦 Trying Twitter #{x_idx + 1}...")
+                print(f"   🐦 Using Twitter #{x_idx + 1} from pool...")
                 
-                success, error_type, message = try_x_bind_and_claim(token, auth_token, ct0, x_idx + 1)
+                success, error_type, message = try_x_bind_and_claim(token, auth_token, ct0, x_idx + 1, dgrid_user_id, proxies)
                 
                 if success:
                     print(f"   ✓ X Bind: OK")
+                    print(f"   ✓ Follow: @dgrid_ai")
                     print(f"   ✓ Follow Claim: OK")
                     x_success = True
                     used_x_index = x_idx
@@ -447,21 +682,21 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
                 else:
                     print(f"   ✗ {message}")
                     if error_type == "x_bind":
-                        print(f"   ↻ Trying next Twitter account...")
+                        print(f"   ↻ Trying next Twitter from pool...")
             
             if not x_success:
                 if not available_x_cookies:
-                    print("   ✗ No Twitter accounts available")
+                    print("   ✗ No Twitter accounts in pool")
                     return False, "No Twitter data", None
-                print("   ✗ All Twitter accounts failed for this wallet")
-                return False, "All Twitter accounts exhausted", None
+                print("   ✗ All Twitter accounts in pool failed or used")
+                return False, "Twitter pool exhausted", None
             
             # Mark this Twitter account as used
             if used_x_index is not None:
                 used_x_indices.add(used_x_index)
         
         # Refresh status
-        ticket = check_ticket(token)
+        ticket = check_ticket(token, proxies)
         chain_signed = ticket.get("hasSignedChain", False)
         
         # Sign chain if needed (critical step with retry)
@@ -477,7 +712,7 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
                     break
                 else:
                     # Check if actually signed
-                    ticket = check_ticket(token)
+                    ticket = check_ticket(token, proxies)
                     if ticket.get("hasSignedChain"):
                         chain_signed = True
                         print("   ✓ Chain: Already signed (confirmed)")
@@ -497,16 +732,16 @@ def process_wallet(w3, private_key, available_x_cookies, used_x_indices, index, 
             print("   ✓ Chain: Already signed")
         
         # Missions
-        completed, pts = complete_missions(token)
+        completed, pts = complete_missions(token, config, proxies)
         print(f"   ✓ Missions: +{pts} pts ({completed} new)")
         
         # Claim follow mission reward
-        follow_claimed, follow_result = claim_follow_mission(token)
+        follow_claimed, follow_result = claim_follow_mission(token, proxies)
         if follow_claimed:
             print("   ✓ Follow Mission: Claimed")
         
         # Leaderboard
-        lb = get_leaderboard(token)
+        lb = get_leaderboard(token, proxies)
         print(f"   ✓ Rank: #{lb.get('rank', 0)} | Weekly: {lb.get('weeklyPoints', 0)} pts")
         
         # Transfer to next wallet if success
@@ -531,6 +766,10 @@ def main():
 ║  https://t.me/MDFKOfficial              ║
 ╚═════════════════════════════════════════╝""")
     
+    # Load configuration
+    config = load_config()
+    proxy_list = load_proxies()
+    
     # Connect to BNB
     w3 = get_web3()
     if not w3:
@@ -546,14 +785,32 @@ def main():
         print("✗ No wallets in wallet.txt")
         return
     
-    if not x_cookies:
-        print("✗ No Twitter accounts in dataX.txt")
-        return
-    
     # Get all addresses for transfer
     addresses = [Account.from_key(pk).address for pk in private_keys]
     
+    if not x_cookies:
+        print("⚠ No Twitter accounts in dataX.txt (only already-bound wallets will be processed)")
+    
     print(f"✓ Loaded {len(private_keys)} wallet(s), {len(x_cookies)} Twitter account(s)")
+    
+    if proxy_list:
+        print(f"✓ Loaded {len(proxy_list)} proxy(ies)")
+    else:
+        print("⚠ No proxies loaded (will use direct connection)")
+    
+    # Get @dgrid_ai user ID once (for follow functionality)
+    dgrid_user_id = None
+    if x_cookies:
+        try:
+            temp_auth, temp_ct0 = x_cookies[0]
+            # Use first proxy if available for initial request
+            temp_proxy = get_proxy_dict(proxy_list[0]) if proxy_list else None
+            temp_session = create_x_session(temp_auth, temp_ct0, temp_proxy)
+            dgrid_user_id, err = get_user_id_from_username(temp_session, "dgrid_ai")
+            if dgrid_user_id:
+                print(f"✓ Target follow: @dgrid_ai (ID: {dgrid_user_id})")
+        except:
+            pass
     
     success = 0
     failed = 0
@@ -563,14 +820,14 @@ def main():
         # Next address for balance transfer (if not last wallet)
         next_addr = addresses[i + 1] if i + 1 < len(addresses) else None
         
-        # Check if we have any Twitter accounts left
-        available_count = len(x_cookies) - len(used_x_indices)
-        if available_count == 0:
-            print(f"\n⚠️ No more Twitter accounts available!")
-            print(f"   Processed: {i} wallets | Remaining: {len(private_keys) - i} wallets")
-            break
+        # 1:1 proxy mapping: use proxy at same index as wallet
+        proxy_url = proxy_list[i] if i < len(proxy_list) else None
+        proxies = get_proxy_dict(proxy_url)
         
-        result, msg, used_idx = process_wallet(w3, pk, x_cookies, used_x_indices, i + 1, len(private_keys), next_addr)
+        if proxy_url:
+            print(f"\n[{i + 1}/{len(private_keys)}] Using proxy: {proxy_url}")
+        
+        result, msg, used_idx = process_wallet(w3, pk, x_cookies, used_x_indices, i + 1, len(private_keys), config, proxies, next_addr, dgrid_user_id)
         
         if result:
             success += 1
@@ -592,5 +849,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
